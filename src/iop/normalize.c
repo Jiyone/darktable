@@ -58,16 +58,13 @@ DT_MODULE_INTROSPECTION(1, dt_iop_normalize_data_t)
 
 typedef struct dt_iop_normalize_data_t
 {
-  float factor;         // $MIN: 0.01 $MAX: 1.0 $DEFAULT: 1.0 $DESCRIPTION: "factor"
+  float factor;         // $MIN: 0.01 $MAX: 2.0 $DEFAULT: 1.0 $DESCRIPTION: "factor"
   gboolean correction;   // $DESCRIPTION: "correction"
 } dt_iop_normalize_data_t;
 
 typedef struct dt_iop_normalize_gui_data_t
 {
-  // Whatever you need to make your gui happy and provide access to widgets between gui_init, gui_update etc.
-  // Stored in self->gui_data while in darkroom.
-  // To permanently store per-user gui configuration settings, you could use dt_conf_set/_get.
-  GtkWidget *factor, *correction; // this is needed by gui_update
+  GtkWidget *factor, *correction;
 } dt_iop_normalize_gui_data_t;
 
 typedef struct dt_iop_normalize_global_data_t
@@ -126,7 +123,7 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
 
   dt_aligned_pixel_t maxi = {0.f};
 
-  // get_maxi(in, roi_out, ch, maxi);
+  const size_t pix = 250 * 4; //for printf debug: pick a pixel.
 
   #ifdef _OPENMP
   #pragma omp parallel for simd reduction(max : maxi) default(none) \
@@ -142,29 +139,41 @@ void process(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const 
 
   printf("[NORMALIZE] maxi : %f %f %f\n", maxi[0], maxi[1], maxi[2]);
 
+  if(d->correction)
+  {
+    for(size_t k = 0; k < (size_t)roi_out->height * roi_out->width * ch; k += ch)
+    for(size_t c = 0; c < 3; c++)
+    {
+      float corrective_pixel = (in[k + c] / maxi[c]); // image de correction normalisée et inversée 
 
+      out[k + c] = corrective_pixel * d->factor;
 
+      out[k + 3] = in[k + 3]; // apply same mask value
+    }
+  }
+  else
+  {
+    printf("[NORMALIZE] in : %f %f %f\n", in[pix], in[pix+1], in[pix+2]);
 #ifdef _OPENMP
 #pragma omp parallel for simd default(none) \
   dt_omp_firstprivate(in, out, roi_in, roi_out, ch, maxi, d) \
   schedule(static) collapse(2) //shared(d)
 #endif
 
-  for(size_t k = 0; k < (size_t)roi_out->height * roi_out->width * ch; k += ch)
-    for(size_t c = 0; c < 3; c++)
-    {
-      float corrective_pixel;
-      corrective_pixel = 1 - (in[k + c] / maxi[c]);
+    for(size_t k = 0; k < (size_t)roi_out->height * roi_out->width * ch; k += ch)
+      for(size_t c = 0; c < 3; c++)
+      {
+        float corrective_pixel = (in[k + c] / maxi[c]); // image de correction normalisée et inversée 
 
-      out[k + c] = (in[k + c] / maxi[c]) / (corrective_pixel * d->factor);
-      out[k + c] *=  maxi[c];
+        out[k + c]  = (in[k + c] / maxi[c]) / (corrective_pixel * d->factor);
+        out[k + c] *= maxi[c];
 
-      out[k + 3] = in[k + 3];
-    }
+        out[k + 3] = in[k + 3]; // apply same mask value
+      }
 
-printf("[NORMALIZE] out : %f %f %f\n", out[0], out[1], out[2]);
+  printf("[NORMALIZE] out : %f %f %f\n", out[pix], out[pix+1], out[pix+2]);
+  }
 }
-
 
 /*
 void init(dt_iop_module_t *module) // Optional init and cleanup
