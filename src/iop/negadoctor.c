@@ -109,7 +109,7 @@ typedef struct dt_iop_negadoctor_params_t
   float wb_high[4];                         /* white balance RGB coeffs (illuminant)
                                                $MIN: 0.25 $MAX: 2 $DEFAULT: 1.0 */
   float wb_low[4];                          /* white balance RGB offsets (base light)
-                                               $MIN: 0.25 $MAX: 2 $DEFAULT: 1.0 */
+                                               $MIN: -2.0 $MAX: 2.0 $DEFAULT: 0.0 */
   float D_max;                              /* max density of film
                                                $MIN: 0.1 $MAX: 6 $DEFAULT: 2.046 */
   float offset;                             /* inversion offset
@@ -268,7 +268,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   // but premultiply it aheard with Dmax to spare one div per pixel
   for(size_t c = 0; c < 4; c++) d->wb_high[c] = p->wb_high[c] / p->D_max;
 
-  for(size_t c = 0; c < 4; c++) d->offset[c] = p->wb_high[c] * p->offset * p->wb_low[c];
+  for(size_t c = 0; c < 4; c++) d->offset[c] = p->wb_high[c] * p->offset + p->wb_low[c] * -0.3f;
 
   // ensure we use a monochrome Dmin for B&W film
   if(p->film_stock == DT_FILMSTOCK_COLOR)
@@ -636,7 +636,7 @@ static void Wb_low_norm_callback(GtkWidget *widget, dt_iop_module_t *self)
 
   const float WB_low_max = v_maxf(p->wb_low);
   for(size_t c = 0; c < 3; ++c)
-    p->wb_low[c] /= WB_low_max;
+    p->wb_low[c] -= WB_low_max;
 
 
   ++darktable.gui->reset;
@@ -751,10 +751,14 @@ static void apply_auto_WB_low(dt_iop_module_t *self)
 
   dt_aligned_pixel_t RGB_min;
   for(int c = 0; c < 3; c++)
-    RGB_min[c] = log10f(p->Dmin[c] / fmaxf(self->picked_color[c], THRESHOLD)) / p->D_max;
+    RGB_min[c] = p->offset - log10f(p->Dmin[c] / fmaxf(self->picked_color[c], THRESHOLD)) / p->D_max;
 
   const float RGB_v_min = v_minf(RGB_min); // warning: can be negative
-  for(int c = 0; c < 3; c++) p->wb_low[c] =  RGB_v_min / RGB_min[c];
+  for(int c = 0; c < 3; c++) p->wb_low[c] = (RGB_min[c] - RGB_v_min) / -0.3f;
+
+  fprintf(stdout,"NEG offset: %f\n", p->offset); 
+  fprintf(stdout,"NEG LOW: %f %f %f\n",RGB_min[0], RGB_min[1], RGB_min[2]);
+  fprintf(stdout,"NEG LOW res: %f %f %f\n",RGB_min[0]- RGB_v_min, RGB_min[1]- RGB_v_min, RGB_min[2]- RGB_v_min);
 
   ++darktable.gui->reset;
   dt_bauhaus_slider_set(g->wb_low_R, p->wb_low[0]);
@@ -777,7 +781,7 @@ static void apply_auto_WB_high(dt_iop_module_t *self)
 
   dt_aligned_pixel_t RGB_min;
   for(int c = 0; c < 3; c++)
-    RGB_min[c] = fabsf(-1.0f / (p->offset * p->wb_low[c] - log10f(p->Dmin[c] / fmaxf(self->picked_color[c], THRESHOLD)) / p->D_max));
+    RGB_min[c] = fabsf(-1.0f / ((p->offset + p->wb_low[c] * -0.3f) - log10f(p->Dmin[c] / fmaxf(self->picked_color[c], THRESHOLD)) / p->D_max));
 
   const float RGB_v_min = v_minf(RGB_min); // warning : must be positive
   for(int c = 0; c < 3; c++) p->wb_high[c] = RGB_min[c] / RGB_v_min;
@@ -806,7 +810,7 @@ static void apply_auto_black(dt_iop_module_t *self)
   {
     RGB[c] = -log10f(p->Dmin[c] / fmaxf(self->picked_color_max[c], THRESHOLD));
     RGB[c] *= p->wb_high[c] / p->D_max;
-    RGB[c] += p->wb_low[c] * p->offset * p->wb_high[c];
+    RGB[c] += p->wb_low[c] * (p->offset + p->wb_low[c] * -0.3f);
     RGB[c] = 0.1f - (1.0f - fast_exp10f(RGB[c])); // actually, remap between -3.32 EV and infinity for safety because gamma comes later
   }
   p->black = v_maxf(RGB);
@@ -832,7 +836,7 @@ static void apply_auto_exposure(dt_iop_module_t *self)
   {
     RGB[c] = -log10f(p->Dmin[c] / fmaxf(self->picked_color_min[c], THRESHOLD));
     RGB[c] *= p->wb_high[c] / p->D_max;
-    RGB[c] += p->wb_low[c] * p->offset;
+    RGB[c] += (p->offset + p->wb_low[c] * -0.3f);
     RGB[c] = 0.96f / (1.0f - fast_exp10f(RGB[c]) + p->black); // actually, remap in [0; 0.96] for safety
   }
   p->exposure = v_minf(RGB);
