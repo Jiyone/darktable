@@ -626,7 +626,7 @@ static void WB_high_picker_callback(GtkColorButton *widget, dt_iop_module_t *sel
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 }
 
-static void Wb_low_norm_callback(GtkColorButton *widget, dt_iop_module_t *self)
+static void Wb_low_norm_callback(GtkWidget *widget, dt_iop_module_t *self)
 {
   if(darktable.gui->reset) return;
 
@@ -650,7 +650,7 @@ static void Wb_low_norm_callback(GtkColorButton *widget, dt_iop_module_t *self)
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 }
 
-static void Wb_high_norm_callback(GtkColorButton *widget, dt_iop_module_t *self)
+static void Wb_high_norm_callback(GtkWidget *widget, dt_iop_module_t *self)
 {
   if(darktable.gui->reset) return;
 
