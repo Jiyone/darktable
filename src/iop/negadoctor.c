@@ -80,6 +80,26 @@ typedef enum dt_iop_negadoctor_filmstock_t
   DT_FILMSTOCK_COLOR = 1 // $DESCRIPTION: "color film"
 } dt_iop_negadoctor_filmstock_t;
 
+typedef enum density_val_t
+{
+  RANGE_MAX_RED = 0,
+  RANGE_MAX_GREEN,
+  RANGE_MAX_BLUE,
+
+  RANGE_MIN_RED,
+  RANGE_MIN_GREEN,
+  RANGE_MIN_BLUE,
+
+  SPOT_RED,
+  SPOT_GREEN,
+  SPOT_BLUE,
+
+  RANGE_MAX_AVERAGE,
+  RANGE_MIN_AVERAGE,
+  SPOT_AVERAGE,
+
+  RANGE_LAST_FIELD
+} density_val_t;
 
 typedef struct dt_iop_negadoctor_params_t
 {
@@ -94,6 +114,10 @@ typedef struct dt_iop_negadoctor_params_t
                                                $MIN: 0.1 $MAX: 6 $DEFAULT: 2.046 */
   float offset;                             /* inversion offset
                                                $MIN: -1.0 $MAX: 1.0 $DEFAULT: -0.05 $DESCRIPTION: "scan exposure bias" */
+  float D[RANGE_LAST_FIELD];                /* Densitometer reading
+                                               $MIN: 0.01 $DEFAULT: 0.01 $DESCRIPTION: "Density measurments" */
+  float D_film_max[3];                      /* Film's Dmax input
+                                               $MIN: 0.0 $MAX: 4.0 $DEFAULT: 2.98 $DESCRIPTION: "Enter the film's dmax (from film's datasheet)" */
   float black;                              /* display black level
                                                $MIN: -0.5 $MAX: 0.5 $DEFAULT: 0.0755 $DESCRIPTION: "paper black (density correction)" */
   float gamma;                              /* display gamma
@@ -127,6 +151,11 @@ typedef struct dt_iop_negadoctor_gui_data_t
   GtkWidget *wb_low_R, *wb_low_G, *wb_low_B;
   GtkWidget *D_max;
   GtkWidget *offset;
+
+  GtkWidget *density_info[RANGE_LAST_FIELD];
+  GtkWidget *D_sampler;
+  GtkWidget *D_film_max_R, *D_film_max_G, *D_film_max_B, *Dmin_range_sampler, *Dmax_range_sampler;
+  
   GtkWidget *black, *gamma, *soft_clip, *exposure;
   GtkWidget *Dmin_picker, *Dmin_sampler;
   GtkWidget *WB_high_picker, *WB_high_norm, *WB_high_sampler;
@@ -816,10 +845,85 @@ static void apply_auto_exposure(dt_iop_module_t *self)
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 }
 
+static void _do_rgb_densities(dt_iop_module_t *self)
+{
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
+  dt_iop_negadoctor_params_t *p = (dt_iop_negadoctor_params_t *)self->params;
+
+  float offset = p->D_film_max[0] / p->D[0];
+  float thing[3] = { 0.f };
+  float average[2][3] = {{ 0.f }};
+
+  for(int k = 0; k < 9; k++) 
+  {
+    thing[k % 3] = p->D[k] * offset;
+    gtk_label_set_text(GTK_LABEL(g->density_info[k]), g_strdup_printf("%.2f", thing[k % 3]));
+
+    if(k % 3 == 2)
+    {
+      average[0][k / 3] = v_minf(thing);
+      average[1][k / 3] = v_maxf(thing);
+    }
+  }
+
+  for(int a = 0; a < 3; a++)
+  {
+    float averaged = (average[0][a] + average[1][a]) / 2;
+    gtk_label_set_text(GTK_LABEL(g->density_info[a + 9]), g_strdup_printf("%.2f", averaged));
+  }
+}
+
+static void apply_dmin_range_picker(dt_iop_module_t *self)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_negadoctor_params_t *p = (dt_iop_negadoctor_params_t *)self->params;
+
+  ++darktable.gui->reset;
+  for(int c = 0; c < 3; c++) 
+  {
+    p->D[c] = log10f(1.f / self->picked_color[c]);
+    fprintf(stdout,"NEG Dmin[%i]: %.2f\n", c, p->D[c]);
+  }
+  --darktable.gui->reset;
+
+  _do_rgb_densities(self);
+}
+
+static void apply_dmax_range_picker(dt_iop_module_t *self)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_negadoctor_params_t *p = (dt_iop_negadoctor_params_t *)self->params;
+
+  ++darktable.gui->reset;
+  fprintf(stdout,"NEG sizeof D: %i\n", sizeof(p->D)/sizeof(float));
+
+  for(int c = 0; c < 3; c++) 
+  {
+    p->D[c + 3] = log10f(1.f / self->picked_color[c]);
+    fprintf(stdout,"NEG D[%i]: %.2f\n",c + 3, p->D[c + 3]);
+  }
+  --darktable.gui->reset;
+
+  _do_rgb_densities(self);
+}
+
+static void density_picker(dt_iop_module_t *self)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_negadoctor_params_t *p = (dt_iop_negadoctor_params_t *)self->params;
+
+  //++darktable.gui->reset;
+  for(int c = 0; c < 3; c++)
+    p->D[c + 6] = log10f(1.f / self->picked_color[c]);
+  //--darktable.gui->reset;
+
+  _do_rgb_densities(self);
+  
+}
 
 void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpipe_iop_t *piece)
 {
-  if(darktable.gui->reset) return;
+  if(darktable.gui->reset || picker == NULL) return;
   dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
 
   if     (picker == g->Dmin_sampler)
@@ -836,8 +940,31 @@ void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpi
     apply_auto_exposure(self);
   else if(picker == g->black)
     apply_auto_black(self);
+  else if(picker == g->D_sampler)
+    density_picker(self);
+  else if(picker == g->Dmin_range_sampler)
+    apply_dmin_range_picker(self);
+  else if(picker == g->Dmax_range_sampler)
+    apply_dmax_range_picker(self);
   else
     fprintf(stderr, "[negadoctor] unknown color picker\n");
+}
+
+//copied from import.c
+static GtkWidget * _attach_aligned_grid_item(GtkWidget *grid, const int row, const int column,
+                                      const char *label, const GtkAlign align, const gboolean fixed_width,
+                                      const gboolean full_width)
+{
+  GtkWidget *w = gtk_label_new(label);
+  if(fixed_width)
+    gtk_label_set_max_width_chars(GTK_LABEL(w), 25);
+
+  gtk_label_set_ellipsize(GTK_LABEL(w), PANGO_ELLIPSIZE_END);
+  gtk_grid_attach(GTK_GRID(grid), w, column, row, full_width ? 2 : 1, 1);
+  gtk_label_set_xalign(GTK_LABEL(w), align);
+  gtk_widget_set_halign(w, align);
+  gtk_label_set_line_wrap(GTK_LABEL(w), TRUE);
+  return w;
 }
 
 void gui_init(dt_iop_module_t *self)
@@ -914,6 +1041,78 @@ void gui_init(dt_iop_module_t *self)
   dt_bauhaus_slider_set_format(g->offset, " dB");
   gtk_widget_set_tooltip_text(g->offset, _("correct the exposure of the scanner, for all RGB channels,\n"
                                            "before the inversion, so blacks are neither clipped or too pale."));
+
+  // Densitometer
+  gtk_box_pack_start(GTK_BOX(page1), dt_ui_section_label_new(_("Densitometer")), FALSE, FALSE, 0);
+
+  GtkWidget *g_densito = GTK_WIDGET(gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0));
+
+  //g->Dmin_range_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, GTK_WIDGET(range_row));
+  g->Dmin_range_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, NULL);
+  gtk_widget_set_tooltip_text(g->Dmin_range_sampler , _("Dmin Range"));
+
+  g->Dmax_range_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, NULL);
+  gtk_widget_set_tooltip_text(g->Dmin_range_sampler , _("Dmax Range"));
+
+  GtkWidget *range = gtk_grid_new();
+  gtk_grid_set_column_spacing(GTK_GRID(range), 10);
+  gtk_grid_set_row_spacing(GTK_GRID(range), 1);
+  _attach_aligned_grid_item(range, 1, 0, _("Red:"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(range, 2, 0, _("Green:"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(range, 3, 0, _("Blue:"), GTK_ALIGN_END, FALSE, FALSE);
+  //_attach_aligned_grid_item(range, 4, 0, _("-"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(range, 5, 0, _("Average:"), GTK_ALIGN_END, FALSE, FALSE);
+
+
+  _attach_aligned_grid_item(range, 0, 1, _("Dmin"), GTK_ALIGN_START, FALSE, FALSE);
+  g->density_info[RANGE_MIN_RED] = _attach_aligned_grid_item(range, 1, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[RANGE_MIN_GREEN] = _attach_aligned_grid_item(range, 2, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[RANGE_MIN_BLUE] = _attach_aligned_grid_item(range, 3, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  gtk_grid_attach(GTK_GRID(range),  g->Dmax_range_sampler, 1, 4, 1, 1);
+  g->density_info[RANGE_MIN_AVERAGE] = _attach_aligned_grid_item(range, 5, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+
+  _attach_aligned_grid_item(range, 0, 2, _("Dmax"), GTK_ALIGN_START, FALSE, FALSE);
+  g->density_info[RANGE_MAX_RED] = _attach_aligned_grid_item(range, 1, 2, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[RANGE_MAX_GREEN] = _attach_aligned_grid_item(range, 2, 2, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[RANGE_MAX_BLUE] = _attach_aligned_grid_item(range, 3, 2, "", GTK_ALIGN_START, TRUE, FALSE);
+  gtk_grid_attach(GTK_GRID(range),  g->Dmin_range_sampler, 2, 4, 1, 1);
+  g->density_info[RANGE_MAX_AVERAGE] = _attach_aligned_grid_item(range, 5, 2, "", GTK_ALIGN_START, TRUE, FALSE);
+
+  
+  g->D_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_POINT_AREA, NULL);
+  gtk_widget_set_tooltip_text(g->D_sampler , _("Read the density value"));
+
+  GtkWidget *spot = gtk_grid_new();
+  gtk_grid_set_column_spacing(GTK_GRID(spot), 10);
+  gtk_grid_set_row_spacing(GTK_GRID(spot), 1);
+
+  _attach_aligned_grid_item(spot, 1, 0, _("Red:"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(spot, 2, 0, _("Green:"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(spot, 3, 0, _("Blue:"), GTK_ALIGN_END, FALSE, FALSE);
+  //_attach_aligned_grid_item(spot, 4, 0, _("-"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(spot, 5, 0, _("Average:"), GTK_ALIGN_END, FALSE, FALSE);
+
+  _attach_aligned_grid_item(spot, 0, 1, _("Spot"), GTK_ALIGN_START, FALSE, FALSE);
+  g->density_info[SPOT_RED] = _attach_aligned_grid_item(spot, 1, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[SPOT_GREEN] = _attach_aligned_grid_item(spot, 2, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[SPOT_BLUE] = _attach_aligned_grid_item(spot, 3, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  gtk_grid_attach(GTK_GRID(spot), g->D_sampler, 1, 4, 1, 1);
+  g->density_info[SPOT_AVERAGE] = _attach_aligned_grid_item(spot, 5, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+
+  gtk_box_pack_start(GTK_BOX(g_densito), GTK_WIDGET(range), TRUE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(g_densito), GTK_WIDGET(spot), TRUE, FALSE, 0);
+
+  gtk_box_pack_start(GTK_BOX(page1), GTK_WIDGET(g_densito), FALSE, FALSE, 5);
+
+
+  g->D_film_max_R = dt_bauhaus_slider_from_params(self, "D_film_max[0]");
+  dt_bauhaus_slider_set_digits(g->D_film_max_R, 2);
+  dt_bauhaus_slider_set_format(g->D_film_max_R, " D");
+  dt_bauhaus_widget_set_label(g->D_film_max_R, NULL, N_("Film Dmax red"));
+  gtk_widget_set_tooltip_text(g->D_film_max_R, _("Set the Dmax of the film to calibrate values.\n"));
+
+  for(int k = 0; k < 12; k++)
+    gtk_label_set_text(GTK_LABEL(g->density_info[k]), "n/a");
 
   // Page CORRECTIONS
   GtkWidget *page2 = self->widget = dt_ui_notebook_page(g->notebook, N_("corrections"), NULL);
@@ -1078,6 +1277,12 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
   {
     WB_low_picker_update(self);
   }
+
+  if(!w || w == g->D_film_max_R)
+  {
+    _do_rgb_densities(self);
+  }
+  
 }
 
 
