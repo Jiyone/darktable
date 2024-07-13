@@ -20,8 +20,12 @@
 #endif
 
 #include "bauhaus/bauhaus.h"
+#include "chart/common.h"
+#include "dtgtk/drawingarea.h"
 #include "common/darktable.h"
 #include "common/opencl.h"
+#include "common/colorchecker.h"
+#include "chart/colorchart.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -39,6 +43,7 @@
 #include <glib.h>
 #include <math.h>
 #include <stdlib.h>
+#include <gtk/gtk.h>
 
 #if defined(__GNUC__)
 #pragma GCC optimize ("unroll-loops", "tree-loop-if-convert", \
@@ -48,7 +53,8 @@
                       "split-ivs-in-unroller", "variable-expansion-in-unroller", \
                       "split-loops", "ivopts", "predictive-commoning",\
                       "tree-loop-linear", "loop-block", "loop-strip-mine", \
-                      "finite-math-only", "fp-contract=fast", "fast-math")
+                      "finite-math-only", "fp-contract=fast", "fast-math", \
+                      "tree-vectorize", "no-math-errno")
 #endif
 
 /** DOCUMENTATION
@@ -113,19 +119,21 @@ typedef struct dt_iop_negadoctor_params_t
   float D_max;                              /* max density of film
                                                $MIN: 0.1 $MAX: 6 $DEFAULT: 2.046 */
   float offset;                             /* inversion offset
-                                               $MIN: -1.0 $MAX: 1.0 $DEFAULT: -0.05 $DESCRIPTION: "scan exposure bias" */
+                                               $MIN: -1.0 $MAX: 1.0 $DEFAULT: -0.00 $DESCRIPTION: "scan exposure bias" */
   float D[RANGE_LAST_FIELD];                /* Densitometer reading
                                                $MIN: 0.01 $DEFAULT: 0.01 $DESCRIPTION: "Density measurments" */
+  int checker;                              /* Step wedges
+                                               $DEFAULT: 0 $DESCRIPTION: "Chosen density chart" */
   float D_film_max[3];                      /* Film's Dmax input
                                                $MIN: 0.0 $MAX: 4.0 $DEFAULT: 2.98 $DESCRIPTION: "Enter the film's dmax (from film's datasheet)" */
   float black;                              /* display black level
-                                               $MIN: -0.5 $MAX: 0.5 $DEFAULT: 0.0755 $DESCRIPTION: "paper black (density correction)" */
+                                               $MIN: -0.5 $MAX: 0.5 $DEFAULT: 0.0 $DESCRIPTION: "paper black (density correction)" */
   float gamma;                              /* display gamma
                                                $MIN: 1.0 $MAX: 8.0 $DEFAULT: 4.0 $DESCRIPTION: "paper grade (gamma)" */
   float soft_clip;                          /* highlights roll-off
-                                               $MIN: 0.0001 $MAX: 1.0 $DEFAULT: 0.75 $DESCRIPTION: "paper gloss (specular highlights)" */
+                                               $MIN: 0.0001 $MAX: 1.0 $DEFAULT: 1.0 $DESCRIPTION: "paper gloss (specular highlights)" */
   float exposure;                           /* extra exposure
-                                               $MIN: -2.0 $MAX: 2.0 $DEFAULT: 0.9245 $DESCRIPTION: "print exposure adjustment" */
+                                               $MIN: -2.0 $MAX: 2.0 $DEFAULT: 1.0 $DESCRIPTION: "print exposure adjustment" */
 } dt_iop_negadoctor_params_t;
 
 
@@ -152,9 +160,27 @@ typedef struct dt_iop_negadoctor_gui_data_t
   GtkWidget *D_max;
   GtkWidget *offset;
 
+  dt_gui_collapsible_section_t cs;
+
   GtkWidget *density_info[RANGE_LAST_FIELD];
-  GtkWidget *D_sampler;
-  GtkWidget *D_film_max_R, *D_film_max_G, *D_film_max_B, *Dmin_range_sampler, *Dmax_range_sampler;
+  GtkWidget *D_sampler, *Dmin_range_sampler, *Dmax_range_sampler;
+  GtkWidget *D_film_max_R, *D_film_max_G, *D_film_max_B;
+  GtkWidget *checkers_list, *safety;
+  float homography[9];          // the perspective correction matrix
+  float inverse_homography[9];  // The inverse perspective correction matrix
+  gboolean checker_ready;       // notify that a checker bounding box is ready to be used
+  
+  gboolean is_profiling_started;
+  point_t box[4];           // the current coordinates, possibly non rectangle, of the bounding box for the color checker
+  point_t ideal_box[4];     // the desired coordinates of the perfect rectangle bounding box for the color checker
+  point_t center_box;       // the barycenter of both boxes
+  gboolean active_node[4];  // true if the cursor is close to a node (node = corner of the bounding box)
+  gboolean is_cursor_close; // do we have the cursor close to a node ?
+  gboolean drag_drop;       // are we currently dragging and dropping a node ?
+  point_t click_start;      // the coordinates where the drag and drop started
+  point_t click_end;        // the coordinates where the drag and drop started
+  dt_step_wedge_t *checker;
+  float safety_margin;
   
   GtkWidget *black, *gamma, *soft_clip, *exposure;
   GtkWidget *Dmin_picker, *Dmin_sampler;
@@ -398,7 +424,8 @@ void init_presets(dt_iop_module_so_t *self)
                                                                  .gamma = 4.0f,
                                                                  .soft_clip = 0.75f,
                                                                  .exposure = 0.9245f,
-                                                                 .black = 0.0755f };
+                                                                 .black = 0.0755f,
+                                                                 .checker = 0};
 
 
   dt_gui_presets_add_generic(_("color film"), self->op,
@@ -413,7 +440,8 @@ void init_presets(dt_iop_module_so_t *self)
                                                                  .gamma = 5.0f,
                                                                  .soft_clip = 0.75f,
                                                                  .exposure = 1.f,
-                                                                 .black = 0.0755f };
+                                                                 .black = 0.0755f,
+                                                                 .checker = 0};
 
 
   dt_gui_presets_add_generic(_("black and white film"), self->op,
@@ -851,8 +879,8 @@ static void apply_auto_exposure(dt_iop_module_t *self)
 
 static void _do_rgb_densities(dt_iop_module_t *self)
 {
-  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
-  dt_iop_negadoctor_params_t *p = (dt_iop_negadoctor_params_t *)self->params;
+  const dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
+  const dt_iop_negadoctor_params_t *p = (dt_iop_negadoctor_params_t *)self->params;
 
   float offset = p->D_film_max[0] / p->D[0];
   float thing[3] = { 0.f };
@@ -916,10 +944,10 @@ static void density_picker(dt_iop_module_t *self)
   if(darktable.gui->reset) return;
   dt_iop_negadoctor_params_t *p = (dt_iop_negadoctor_params_t *)self->params;
 
-  //++darktable.gui->reset;
+  ++darktable.gui->reset;
   for(int c = 0; c < 3; c++)
     p->D[c + 6] = log10f(1.f / self->picked_color[c]);
-  //--darktable.gui->reset;
+  --darktable.gui->reset;
 
   _do_rgb_densities(self);
   
@@ -928,7 +956,7 @@ static void density_picker(dt_iop_module_t *self)
 void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpipe_iop_t *piece)
 {
   if(darktable.gui->reset || picker == NULL) return;
-  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
+  const dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
 
   if     (picker == g->Dmin_sampler)
     apply_auto_Dmin(self);
@@ -971,13 +999,499 @@ static GtkWidget * _attach_aligned_grid_item(GtkWidget *grid, const int row, con
   return w;
 }
 
+static inline void update_bounding_box(dt_iop_negadoctor_gui_data_t *g,
+                                       const float x_increment, const float y_increment)
+{
+  // update box nodes
+  for(size_t k = 0; k < 4; k++)
+  {
+    if(g->active_node[k])
+    {
+      g->box[k].x += x_increment;
+      g->box[k].y += y_increment;
+    }
+  }
+
+  // update the homography
+  get_homography(g->ideal_box, g->box, g->homography);
+  get_homography(g->box, g->ideal_box, g->inverse_homography);
+}
+
+static inline void init_bounding_box(dt_iop_negadoctor_gui_data_t *g, const float width)
+{
+  if(!g->checker_ready)
+  {
+    // top left
+    g->box[0].x = g->box[0].y = 10.;
+
+    // top right
+    g->box[1].x = width - 10.f;
+    g->box[1].y = g->box[0].y;
+
+    // bottom right
+    g->box[2].x = g->box[1].x;
+    g->box[2].y = (width - 10.f) * g->checker->ratio;
+
+    // bottom left
+    g->box[3].x = g->box[0].x;
+    g->box[3].y = g->box[2].y;
+
+    g->checker_ready = TRUE;
+  }
+
+  g->center_box.x = 0.5f;
+  g->center_box.y = 0.5f;
+
+  g->ideal_box[0].x = 0.f;
+  g->ideal_box[0].y = 0.f;
+  g->ideal_box[1].x = 1.f;
+  g->ideal_box[1].y = 0.f;
+  g->ideal_box[2].x = 1.f;
+  g->ideal_box[2].y = 1.f;
+  g->ideal_box[3].x = 0.f;
+  g->ideal_box[3].y = 1.f;
+
+  update_bounding_box(g, 0.f, 0.f);
+}
+
+static void _start_profiling(dt_iop_module_t *self, const gint page_num)
+{
+  if(darktable.gui->reset) return;
+  
+  fprintf(stdout,"START PROF: BEGIN\n");
+  if(!self || self == NULL)
+  {
+    fprintf(stdout,"START PROF: self is NULL\n");
+    return;
+  }
+  fprintf(stdout,"START PROF: self exists\n");
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
+  dt_iop_negadoctor_params_t *p = (dt_iop_negadoctor_params_t *)self->params;
+  dt_iop_request_focus(self);
+  fprintf(stdout,"START PROF: page %i\n", page_num);
+  fprintf(stdout,"START PROF: checker: %i\n", p->checker);
+  
+  if(p->checker && page_num == 3)
+  {
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->off), TRUE);
+
+    const dt_develop_t *dev = self->dev;
+    const float wd = (float) dev->preview_pipe->backbuf_width;
+    const float ht = (float) dev->preview_pipe->backbuf_height;
+    if(wd == 0.f || ht == 0.f) return;
+
+    g->is_profiling_started = TRUE;
+    fprintf(stdout,"START PROF: profiling will start\n");
+    // init bounding box
+    dt_iop_gui_enter_critical_section(self);
+    init_bounding_box(g, wd);
+    dt_iop_gui_leave_critical_section(self);
+  }
+  else
+  {
+    fprintf(stdout,"START PROF: Deactivate profiling\n");
+    g->is_profiling_started = FALSE;
+  }
+
+  fprintf(stdout,"START PROF: redraw center\n");
+  dt_control_queue_redraw_center();
+  fprintf(stdout,"START PROF: redraw center OK\n");
+  
+}
+
+
+static void start_profiling_callback(GtkNotebook* notebook, GtkWidget* page, guint page_num, gpointer user_data)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_module_t *self = (dt_iop_module_t *) user_data;
+  if(!self || self == NULL)
+  {
+    fprintf(stdout,"callback: self is NULL\n");
+    return;
+  }
+  fprintf(stdout,"callback: notebook page\n");
+  _start_profiling(self, page_num);
+  fprintf(stdout,"callback: notebook page end\n");
+}
+
+int mouse_moved(struct dt_iop_module_t *self, double x, double y, double pressure, int which)
+{
+  if(!self->enabled) return 0;
+
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
+  if(g == NULL || !g->is_profiling_started) return 0;
+  if(g->box[0].x == -1.0f || g->box[1].y == -1.0f) return 0;
+
+  dt_develop_t *dev = self->dev;
+  const float wd = dev->preview_pipe->backbuf_width;
+  const float ht = dev->preview_pipe->backbuf_height;
+  if(wd == 0.f || ht == 0.f) return 0;
+
+  float pzx, pzy;
+  dt_dev_get_pointer_zoom_pos(dev, x, y, &pzx, &pzy);
+  pzx += 0.5f;
+  pzy += 0.5f;
+  pzx *= wd;
+  pzy *= ht;
+
+  // if dragging and dropping, don't update active nodes,
+  // just update cursor coordinates then redraw
+  // this ensure smooth updates
+  if(g->drag_drop)
+  {
+    dt_iop_gui_enter_critical_section(self);
+    g->click_end.x = pzx;
+    g->click_end.y = pzy;
+
+    update_bounding_box(g, g->click_end.x - g->click_start.x, g->click_end.y - g->click_start.y);
+
+    g->click_start.x = pzx;
+    g->click_start.y = pzy;
+    dt_iop_gui_leave_critical_section(self);
+
+    dt_control_queue_redraw_center();
+    return 1;
+  }
+
+  // Find out if we are close to a node
+  dt_iop_gui_enter_critical_section(self);
+  g->is_cursor_close = FALSE;
+
+  for(size_t k = 0; k < 4; k++)
+  {
+    if(hypotf(pzx - g->box[k].x, pzy - g->box[k].y) < 15.f)
+    {
+      g->active_node[k] = TRUE;
+      g->is_cursor_close = TRUE;
+    }
+    else
+      g->active_node[k] = FALSE;
+  }
+  dt_iop_gui_leave_critical_section(self);
+
+  // if cursor is close from a node, remove the system pointer arrow to prevent hiding the spot behind it
+  if(g->is_cursor_close)
+  {
+    dt_control_change_cursor(GDK_BLANK_CURSOR);
+  }
+  else
+  {
+    // fall back to default cursor
+    GdkCursor *const cursor = gdk_cursor_new_from_name(gdk_display_get_default(), "default");
+    gdk_window_set_cursor(gtk_widget_get_window(dt_ui_main_window(darktable.gui->ui)), cursor);
+    g_object_unref(cursor);
+  }
+
+  dt_control_queue_redraw_center();
+
+  return 1;
+}
+
+int button_pressed(struct dt_iop_module_t *self, double x, double y, double pressure, int which, int type,
+                   uint32_t state)
+{
+  if(!self->enabled) return 0;
+
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
+  if(g == NULL || !g->is_profiling_started) return 0;
+
+  dt_develop_t *dev = self->dev;
+  const float wd = dev->preview_pipe->backbuf_width;
+  const float ht = dev->preview_pipe->backbuf_height;
+  if(wd == 0.f || ht == 0.f) return 0;
+
+  // double click : reset the perspective correction
+  if(type == GDK_DOUBLE_BUTTON_PRESS)
+  {
+    dt_iop_gui_enter_critical_section(self);
+    g->checker_ready = FALSE;
+    //g->profile_ready = FALSE;
+    init_bounding_box(g, wd);
+    dt_iop_gui_leave_critical_section(self);
+
+    dt_control_queue_redraw_center();
+    return 1;
+  }
+
+  // bounded box not inited, abort
+  if(g->box[0].x == -1.0f || g->box[1].y == -1.0f) return 0;
+
+  // cursor is not on a node, abort
+  if(!g->is_cursor_close) return 0;
+
+  float pzx, pzy;
+  dt_dev_get_pointer_zoom_pos(dev, x, y, &pzx, &pzy);
+  pzx += 0.5f;
+  pzy += 0.5f;
+  pzx *= wd;
+  pzy *= ht;
+
+  dt_iop_gui_enter_critical_section(self);
+  g->drag_drop = TRUE;
+  g->click_start.x = pzx;
+  g->click_start.y = pzy;
+  dt_iop_gui_leave_critical_section(self);
+
+  dt_control_queue_redraw_center();
+
+  return 1;
+}
+
+int button_released(struct dt_iop_module_t *self, double x, double y, int which, uint32_t state)
+{
+  if(!self->enabled) return 0;
+
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
+  if(g == NULL || !g->is_profiling_started) return 0;
+  if(g->box[0].x == -1.0f || g->box[1].y == -1.0f) return 0;
+  if(!g->is_cursor_close || !g->drag_drop) return 0;
+
+  dt_develop_t *dev = self->dev;
+  const float wd = dev->preview_pipe->backbuf_width;
+  const float ht = dev->preview_pipe->backbuf_height;
+  if(wd == 0.f || ht == 0.f) return 0;
+
+  float pzx, pzy;
+  dt_dev_get_pointer_zoom_pos(dev, x, y, &pzx, &pzy);
+  pzx += 0.5f;
+  pzy += 0.5f;
+  pzx *= wd;
+  pzy *= ht;
+
+  dt_iop_gui_enter_critical_section(self);
+  g->drag_drop = FALSE;
+  g->click_end.x = pzx;
+  g->click_end.y = pzy;
+  update_bounding_box(g, g->click_end.x - g->click_start.x, g->click_end.y - g->click_start.y);
+  dt_iop_gui_leave_critical_section(self);
+
+  dt_control_queue_redraw_center();
+
+  return 1;
+}
+
+void gui_post_expose(struct dt_iop_module_t *self, cairo_t *cr, int32_t width, int32_t height,
+                     int32_t pointerx, int32_t pointery)
+{
+  const dt_iop_order_iccprofile_info_t *const work_profile = dt_ioppr_get_pipe_output_profile_info(self->dev->pipe);
+  if(work_profile == NULL) return;
+
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
+  if(!g->is_profiling_started) return;
+
+  // Rescale and shift Cairo drawing coordinates
+  dt_develop_t *dev = self->dev;
+  const float wd = dev->preview_pipe->backbuf_width;
+  const float ht = dev->preview_pipe->backbuf_height;
+  if(wd == 0.f || ht == 0.f) return;
+
+  const float zoom_y = dt_control_get_dev_zoom_y();
+  const float zoom_x = dt_control_get_dev_zoom_x();
+  const dt_dev_zoom_t zoom = dt_control_get_dev_zoom();
+  const int closeup = dt_control_get_dev_closeup();
+  const float zoom_scale = dt_dev_get_zoom_scale(dev, zoom, 1<<closeup, 1);
+  cairo_translate(cr, width / 2.0, height / 2.0);
+  cairo_scale(cr, zoom_scale, zoom_scale);
+  cairo_translate(cr, -.5f * wd - zoom_x * wd, -.5f * ht - zoom_y * ht);
+
+  cairo_set_line_width(cr, 2.0 / zoom_scale);
+  const double origin = 9. / zoom_scale;
+  const double destination = 18. / zoom_scale;
+
+  for(size_t k = 0; k < 4; k++)
+  {
+    if(g->active_node[k])
+    {
+      // draw cross hair
+      cairo_set_source_rgba(cr, 1., 1., 1., 1.);
+
+      cairo_move_to(cr, g->box[k].x - origin, g->box[k].y);
+      cairo_line_to(cr, g->box[k].x - destination, g->box[k].y);
+
+      cairo_move_to(cr, g->box[k].x + origin, g->box[k].y);
+      cairo_line_to(cr, g->box[k].x + destination, g->box[k].y);
+
+      cairo_move_to(cr, g->box[k].x, g->box[k].y - origin);
+      cairo_line_to(cr, g->box[k].x, g->box[k].y - destination);
+
+      cairo_move_to(cr, g->box[k].x, g->box[k].y + origin);
+      cairo_line_to(cr, g->box[k].x, g->box[k].y + destination);
+
+      cairo_stroke(cr);
+    }
+
+    // draw outline circle
+    cairo_set_source_rgba(cr, 1., 1., 1., 1.);
+    cairo_arc(cr, g->box[k].x, g->box[k].y, 8. / zoom_scale, 0, 2. * M_PI);
+    cairo_stroke(cr);
+
+    // draw black dot
+    cairo_set_source_rgba(cr, 0., 0., 0., 1.);
+    cairo_arc(cr, g->box[k].x, g->box[k].y, 1.5 / zoom_scale, 0, 2. * M_PI);
+    cairo_fill(cr);
+  }
+
+  // draw symmetry axes
+  cairo_set_line_width(cr, 1.5 / zoom_scale);
+  cairo_set_source_rgba(cr, 1., 1., 1., 1.);
+  const point_t top_ideal = { 0.5f, 1.f };
+  const point_t top = apply_homography(top_ideal, g->homography);
+  const point_t bottom_ideal = { 0.5f, 0.f };
+  const point_t bottom = apply_homography(bottom_ideal, g->homography);
+  cairo_move_to(cr, top.x, top.y);
+  cairo_line_to(cr, bottom.x, bottom.y);
+  cairo_stroke(cr);
+
+  const point_t left_ideal = { 0.f, 0.5f };
+  const point_t left = apply_homography(left_ideal, g->homography);
+  const point_t right_ideal = { 1.f, 0.5f };
+  const point_t right = apply_homography(right_ideal, g->homography);
+  cairo_move_to(cr, left.x, left.y);
+  cairo_line_to(cr, right.x, right.y);
+  cairo_stroke(cr);
+
+  /* For debug : display center of the image and center of the ideal target
+  point_t new_target_center = apply_homography(target_center, g->homography);
+  cairo_set_source_rgba(cr, 1., 1., 1., 1.);
+  cairo_arc(cr, new_target_center.x, new_target_center.y, 7., 0, 2. * M_PI);
+  cairo_stroke(cr);
+
+  cairo_set_source_rgba(cr, 0., 1., 1., 1.);
+  cairo_arc(cr, 0.5 * wd, 0.5 * ht, 7., 0, 2. * M_PI);
+  cairo_stroke(cr);
+  */
+
+  const float radius_x = g->checker->radius * hypotf(1.f, g->checker->ratio) * g->safety_margin;
+  const float radius_y = radius_x / g->checker->ratio;
+
+  for(size_t k = 0; k < g->checker->patches; k++)
+  {
+    // center of the patch in the ideal reference
+    const point_t center = { g->checker->values[k].x, g->checker->values[k].y };
+
+    // corners of the patch in the ideal reference
+    const point_t corners[4] = { {center.x - radius_x, center.y - radius_y},
+                                 {center.x + radius_x, center.y - radius_y},
+                                 {center.x + radius_x, center.y + radius_y},
+                                 {center.x - radius_x, center.y + radius_y} };
+
+    // apply patch coordinates transform depending on perspective
+    const point_t new_center = apply_homography(center, g->homography);
+    // apply_homography_scaling gives a scaling of areas. we need to scale the
+    // radius of the center circle so take a square root.
+    const float scaling = sqrtf(apply_homography_scaling(center, g->homography));
+    point_t new_corners[4];
+    for(size_t c = 0; c < 4; c++) new_corners[c] = apply_homography(corners[c], g->homography);
+
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_SQUARE);
+    cairo_set_source_rgba(cr, 0., 0., 0., 1.);
+    cairo_move_to(cr, new_corners[0].x, new_corners[0].y);
+    cairo_line_to(cr, new_corners[1].x, new_corners[1].y);
+    cairo_line_to(cr, new_corners[2].x, new_corners[2].y);
+    cairo_line_to(cr, new_corners[3].x, new_corners[3].y);
+    cairo_line_to(cr, new_corners[0].x, new_corners[0].y);
+
+    /*if(g->delta_E_in)
+    {
+      // draw delta E feedback
+      if(g->delta_E_in[k] > 2.3f)
+      {
+        // one diagonal if delta E > 3
+        cairo_move_to(cr, new_corners[0].x, new_corners[0].y);
+        cairo_line_to(cr, new_corners[2].x, new_corners[2].y);
+      }
+      if(g->delta_E_in[k] > 4.6f)
+      {
+        // the other diagonal if delta E > 6
+        cairo_move_to(cr, new_corners[1].x, new_corners[1].y);
+        cairo_line_to(cr, new_corners[3].x, new_corners[3].y);
+      }
+    }
+*/
+    cairo_set_line_width(cr, 5.0 / zoom_scale);
+    cairo_stroke_preserve(cr);
+    cairo_set_line_width(cr, 2.0 / zoom_scale);
+    cairo_set_source_rgba(cr, 1., 1., 1., 1.);
+    cairo_stroke(cr);
+
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_BUTT);
+
+    dt_aligned_pixel_t RGB;
+    dt_ioppr_lab_to_rgb_matrix(g->checker->values[k].Lab, RGB, work_profile->matrix_out_transposed, work_profile->lut_out,
+                               work_profile->unbounded_coeffs_out, work_profile->lutsize,
+                               work_profile->nonlinearlut);
+
+    cairo_set_source_rgba(cr, RGB[0], RGB[1], RGB[2], 1.);
+    cairo_arc(cr, new_center.x, new_center.y, 0.25 * (radius_x + radius_y) * scaling, 0, 2. * M_PI);
+    cairo_fill(cr);
+  }
+}
+
+static void checker_changed_callback(GtkWidget *widget, gpointer user_data)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
+  dt_iop_negadoctor_params_t *p = (dt_iop_negadoctor_params_t *)self->params;
+
+  p->checker = dt_bauhaus_combobox_get(widget); //get choosen step wedge 
+  fprintf(stdout, "CHECKER number: %i\n", p->checker);
+  if(p->checker == 0)
+  {
+    fprintf(stdout, "CHECKER: NONE\n");
+    gtk_widget_set_visible(g->safety, FALSE);
+    g->is_profiling_started = FALSE;
+    g->checker_ready = FALSE;
+    dt_control_queue_redraw_center();
+  }
+  else
+  {
+    g->checker = dt_get_negadoctor_step_wedge(p->checker - 1); // use selected step wedge
+    gtk_widget_set_visible(g->safety, TRUE);
+  
+    // now we have a step wedge
+    fprintf(stdout, "CHECKER: %s\n", g->checker->name);
+    _start_profiling(self, gtk_notebook_get_current_page(g->notebook));
+  }
+  //dt_dev_add_history_item(darktable.develop, self, TRUE);
+}
+
+static void safety_changed_callback(GtkWidget *widget, gpointer user_data)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
+
+  dt_iop_gui_enter_critical_section(self);
+  g->safety_margin = dt_bauhaus_slider_get(widget);
+  dt_iop_gui_leave_critical_section(self);
+
+  dt_conf_set_float("darkroom/modules/negadoctor/safety", g->safety_margin);
+  dt_control_queue_redraw_center();
+}
+
+
+
+
+
 void gui_init(dt_iop_module_t *self)
 {
   dt_iop_negadoctor_gui_data_t *g = IOP_GUI_ALLOC(negadoctor);
 
+ // Init the color checker UI
+  for(size_t k = 0; k < 4; k++)
+  {
+    g->box[k].x = g->box[k].y = -1.;
+    g->active_node[k] = FALSE;
+  }
+  g->is_cursor_close = FALSE;
+  g->drag_drop = FALSE;
+  g->checker_ready = FALSE;
+
   static dt_action_def_t notebook_def = { };
   g->notebook = dt_ui_notebook_new(&notebook_def);
   dt_action_define_iop(self, NULL, N_("page"), GTK_WIDGET(g->notebook), &notebook_def);
+  g_signal_connect(G_OBJECT(g->notebook), "switch-page", G_CALLBACK(start_profiling_callback), self);
 
   // Page FILM PROPERTIES
   GtkWidget *page1 = self->widget = dt_ui_notebook_page(g->notebook, N_("film properties"), NULL);
@@ -1045,78 +1559,6 @@ void gui_init(dt_iop_module_t *self)
   dt_bauhaus_slider_set_format(g->offset, " dB");
   gtk_widget_set_tooltip_text(g->offset, _("correct the exposure of the scanner, for all RGB channels,\n"
                                            "before the inversion, so blacks are neither clipped or too pale."));
-
-  // Densitometer
-  gtk_box_pack_start(GTK_BOX(page1), dt_ui_section_label_new(_("Densitometer")), FALSE, FALSE, 0);
-
-  GtkWidget *g_densito = GTK_WIDGET(gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0));
-
-  //g->Dmin_range_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, GTK_WIDGET(range_row));
-  g->Dmin_range_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, NULL);
-  gtk_widget_set_tooltip_text(g->Dmin_range_sampler , _("Dmin Range"));
-
-  g->Dmax_range_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, NULL);
-  gtk_widget_set_tooltip_text(g->Dmin_range_sampler , _("Dmax Range"));
-
-  GtkWidget *range = gtk_grid_new();
-  gtk_grid_set_column_spacing(GTK_GRID(range), 10);
-  gtk_grid_set_row_spacing(GTK_GRID(range), 1);
-  _attach_aligned_grid_item(range, 1, 0, _("Red:"), GTK_ALIGN_END, FALSE, FALSE);
-  _attach_aligned_grid_item(range, 2, 0, _("Green:"), GTK_ALIGN_END, FALSE, FALSE);
-  _attach_aligned_grid_item(range, 3, 0, _("Blue:"), GTK_ALIGN_END, FALSE, FALSE);
-  //_attach_aligned_grid_item(range, 4, 0, _("-"), GTK_ALIGN_END, FALSE, FALSE);
-  _attach_aligned_grid_item(range, 5, 0, _("Average:"), GTK_ALIGN_END, FALSE, FALSE);
-
-
-  _attach_aligned_grid_item(range, 0, 1, _("Dmin"), GTK_ALIGN_START, FALSE, FALSE);
-  g->density_info[RANGE_MIN_RED] = _attach_aligned_grid_item(range, 1, 1, "", GTK_ALIGN_START, TRUE, FALSE);
-  g->density_info[RANGE_MIN_GREEN] = _attach_aligned_grid_item(range, 2, 1, "", GTK_ALIGN_START, TRUE, FALSE);
-  g->density_info[RANGE_MIN_BLUE] = _attach_aligned_grid_item(range, 3, 1, "", GTK_ALIGN_START, TRUE, FALSE);
-  gtk_grid_attach(GTK_GRID(range),  g->Dmax_range_sampler, 1, 4, 1, 1);
-  g->density_info[RANGE_MIN_AVERAGE] = _attach_aligned_grid_item(range, 5, 1, "", GTK_ALIGN_START, TRUE, FALSE);
-
-  _attach_aligned_grid_item(range, 0, 2, _("Dmax"), GTK_ALIGN_START, FALSE, FALSE);
-  g->density_info[RANGE_MAX_RED] = _attach_aligned_grid_item(range, 1, 2, "", GTK_ALIGN_START, TRUE, FALSE);
-  g->density_info[RANGE_MAX_GREEN] = _attach_aligned_grid_item(range, 2, 2, "", GTK_ALIGN_START, TRUE, FALSE);
-  g->density_info[RANGE_MAX_BLUE] = _attach_aligned_grid_item(range, 3, 2, "", GTK_ALIGN_START, TRUE, FALSE);
-  gtk_grid_attach(GTK_GRID(range),  g->Dmin_range_sampler, 2, 4, 1, 1);
-  g->density_info[RANGE_MAX_AVERAGE] = _attach_aligned_grid_item(range, 5, 2, "", GTK_ALIGN_START, TRUE, FALSE);
-
-  
-  g->D_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_POINT_AREA, NULL);
-  gtk_widget_set_tooltip_text(g->D_sampler , _("Read the density value"));
-
-  GtkWidget *spot = gtk_grid_new();
-  gtk_grid_set_column_spacing(GTK_GRID(spot), 10);
-  gtk_grid_set_row_spacing(GTK_GRID(spot), 1);
-
-  _attach_aligned_grid_item(spot, 1, 0, _("Red:"), GTK_ALIGN_END, FALSE, FALSE);
-  _attach_aligned_grid_item(spot, 2, 0, _("Green:"), GTK_ALIGN_END, FALSE, FALSE);
-  _attach_aligned_grid_item(spot, 3, 0, _("Blue:"), GTK_ALIGN_END, FALSE, FALSE);
-  //_attach_aligned_grid_item(spot, 4, 0, _("-"), GTK_ALIGN_END, FALSE, FALSE);
-  _attach_aligned_grid_item(spot, 5, 0, _("Average:"), GTK_ALIGN_END, FALSE, FALSE);
-
-  _attach_aligned_grid_item(spot, 0, 1, _("Spot"), GTK_ALIGN_START, FALSE, FALSE);
-  g->density_info[SPOT_RED] = _attach_aligned_grid_item(spot, 1, 1, "", GTK_ALIGN_START, TRUE, FALSE);
-  g->density_info[SPOT_GREEN] = _attach_aligned_grid_item(spot, 2, 1, "", GTK_ALIGN_START, TRUE, FALSE);
-  g->density_info[SPOT_BLUE] = _attach_aligned_grid_item(spot, 3, 1, "", GTK_ALIGN_START, TRUE, FALSE);
-  gtk_grid_attach(GTK_GRID(spot), g->D_sampler, 1, 4, 1, 1);
-  g->density_info[SPOT_AVERAGE] = _attach_aligned_grid_item(spot, 5, 1, "", GTK_ALIGN_START, TRUE, FALSE);
-
-  gtk_box_pack_start(GTK_BOX(g_densito), GTK_WIDGET(range), TRUE, FALSE, 0);
-  gtk_box_pack_start(GTK_BOX(g_densito), GTK_WIDGET(spot), TRUE, FALSE, 0);
-
-  gtk_box_pack_start(GTK_BOX(page1), GTK_WIDGET(g_densito), FALSE, FALSE, 5);
-
-
-  g->D_film_max_R = dt_bauhaus_slider_from_params(self, "D_film_max[0]");
-  dt_bauhaus_slider_set_digits(g->D_film_max_R, 2);
-  dt_bauhaus_slider_set_format(g->D_film_max_R, " D");
-  dt_bauhaus_widget_set_label(g->D_film_max_R, NULL, N_("Film Dmax red"));
-  gtk_widget_set_tooltip_text(g->D_film_max_R, _("Set the Dmax of the film to calibrate values.\n"));
-
-  for(int k = 0; k < 12; k++)
-    gtk_label_set_text(GTK_LABEL(g->density_info[k]), "n/a");
 
   // Page CORRECTIONS
   GtkWidget *page2 = self->widget = dt_ui_notebook_page(g->notebook, N_("corrections"), NULL);
@@ -1238,6 +1680,98 @@ void gui_init(dt_iop_module_t *self)
   gtk_widget_set_tooltip_text(g->exposure, _("correct the printing exposure after inversion to adjust\n"
                                              "the global contrast and avoid clipping highlights."));
 
+  // Densitometer
+
+  GtkWidget *page4 = self->widget = dt_ui_notebook_page(g->notebook, N_("Density"), NULL);
+
+  gtk_box_pack_start(GTK_BOX(page4), dt_ui_section_label_new(_("Step wedge")), FALSE, FALSE, 0);
+
+  GtkWidget *g_stepwedge = self->widget = GTK_WIDGET(gtk_box_new(GTK_ORIENTATION_VERTICAL, 0));
+
+  DT_BAUHAUS_COMBOBOX_NEW_FULL(g->checkers_list, self, NULL, N_("Use a step wedge"),
+                                _("choose the vendor and the type of your chart"),
+                                0, checker_changed_callback, self,
+                                N_("None"),
+                                N_("Stouffer 21 Steps Wedge"));
+  gtk_box_pack_start(GTK_BOX(g_stepwedge), GTK_WIDGET(g->checkers_list), TRUE, FALSE, 0);
+
+  g->safety = dt_bauhaus_slider_new_with_range_and_feedback(self, 0., 1., 0, 0.5, 3, TRUE);
+  dt_bauhaus_widget_set_label(g->safety, NULL, N_("patch scale"));
+  gtk_widget_set_tooltip_text(g->safety, _("reduce the radius of the patches to select the more or less central part.\n"
+                                           "useful when the perspective correction is sloppy or\n"
+                                           "the patches frame cast a shadows on the edges of the patch." ));
+  g_signal_connect(G_OBJECT(g->safety), "value-changed", G_CALLBACK(safety_changed_callback), self);
+  gtk_box_pack_start(GTK_BOX(g_stepwedge), GTK_WIDGET(g->safety), TRUE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(page4), GTK_WIDGET(g_stepwedge), FALSE, FALSE, 0);
+
+  gtk_box_pack_start(GTK_BOX(page4), dt_ui_section_label_new(_("Densities")), FALSE, FALSE, 0);
+
+  GtkWidget *g_densito = self->widget = GTK_WIDGET(gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0));
+
+  //g->Dmin_range_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, GTK_WIDGET(range_row));
+  g->Dmin_range_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, NULL);
+  gtk_widget_set_tooltip_text(g->Dmin_range_sampler , _("Dmin Range"));
+
+  g->Dmax_range_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, NULL);
+  gtk_widget_set_tooltip_text(g->Dmin_range_sampler , _("Dmax Range"));
+
+  GtkWidget *range = gtk_grid_new();
+  gtk_grid_set_column_spacing(GTK_GRID(range), 10);
+  gtk_grid_set_row_spacing(GTK_GRID(range), 1);
+  _attach_aligned_grid_item(range, 1, 0, _("Red:"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(range, 2, 0, _("Green:"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(range, 3, 0, _("Blue:"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(range, 5, 0, _("Average:"), GTK_ALIGN_END, FALSE, FALSE);
+
+  _attach_aligned_grid_item(range, 0, 1, _("Dmin"), GTK_ALIGN_START, FALSE, FALSE);
+  g->density_info[RANGE_MIN_RED] = _attach_aligned_grid_item(range, 1, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[RANGE_MIN_GREEN] = _attach_aligned_grid_item(range, 2, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[RANGE_MIN_BLUE] = _attach_aligned_grid_item(range, 3, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  gtk_grid_attach(GTK_GRID(range),  g->Dmax_range_sampler, 1, 4, 1, 1);
+  g->density_info[RANGE_MIN_AVERAGE] = _attach_aligned_grid_item(range, 5, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+
+  _attach_aligned_grid_item(range, 0, 2, _("Dmax"), GTK_ALIGN_START, FALSE, FALSE);
+  g->density_info[RANGE_MAX_RED] = _attach_aligned_grid_item(range, 1, 2, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[RANGE_MAX_GREEN] = _attach_aligned_grid_item(range, 2, 2, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[RANGE_MAX_BLUE] = _attach_aligned_grid_item(range, 3, 2, "", GTK_ALIGN_START, TRUE, FALSE);
+  gtk_grid_attach(GTK_GRID(range),  g->Dmin_range_sampler, 2, 4, 1, 1);
+  g->density_info[RANGE_MAX_AVERAGE] = _attach_aligned_grid_item(range, 5, 2, "", GTK_ALIGN_START, TRUE, FALSE);
+
+  gtk_box_pack_start(GTK_BOX(g_densito), GTK_WIDGET(range), TRUE, FALSE, 0);
+
+  
+  g->D_sampler = dt_color_picker_new(self, DT_COLOR_PICKER_POINT_AREA, NULL);
+  gtk_widget_set_tooltip_text(g->D_sampler , _("Read the density value"));
+
+  GtkWidget *spot = gtk_grid_new();
+  gtk_grid_set_column_spacing(GTK_GRID(spot), 10);
+  gtk_grid_set_row_spacing(GTK_GRID(spot), 1);
+
+  _attach_aligned_grid_item(spot, 1, 0, _("Red:"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(spot, 2, 0, _("Green:"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(spot, 3, 0, _("Blue:"), GTK_ALIGN_END, FALSE, FALSE);
+  _attach_aligned_grid_item(spot, 5, 0, _("Average:"), GTK_ALIGN_END, FALSE, FALSE);
+
+  _attach_aligned_grid_item(spot, 0, 1, _("Spot"), GTK_ALIGN_START, FALSE, FALSE);
+  g->density_info[SPOT_RED] = _attach_aligned_grid_item(spot, 1, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[SPOT_GREEN] = _attach_aligned_grid_item(spot, 2, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  g->density_info[SPOT_BLUE] = _attach_aligned_grid_item(spot, 3, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+  gtk_grid_attach(GTK_GRID(spot), g->D_sampler, 1, 4, 1, 1);
+  g->density_info[SPOT_AVERAGE] = _attach_aligned_grid_item(spot, 5, 1, "", GTK_ALIGN_START, TRUE, FALSE);
+
+  gtk_box_pack_start(GTK_BOX(g_densito), GTK_WIDGET(spot), TRUE, FALSE, 0);
+
+  gtk_box_pack_start(GTK_BOX(page4), GTK_WIDGET(g_densito), FALSE, FALSE, 0);
+
+  self->widget = GTK_WIDGET(page4);
+  g->D_film_max_R = dt_bauhaus_slider_from_params(self, "D_film_max[0]");
+  dt_bauhaus_slider_set_digits(g->D_film_max_R, 2);
+  dt_bauhaus_slider_set_format(g->D_film_max_R, " D");
+  dt_bauhaus_widget_set_label(g->D_film_max_R, NULL, N_("Film Dmax red"));
+  gtk_widget_set_tooltip_text(g->D_film_max_R, _("Set the Dmax of the film to calibrate values.\n"));
+
+  //for(int k = 0; k < 12; k++) gtk_label_set_text(GTK_LABEL(g->density_info[k]), "n/a");
+    
   // start building top level widget
   self->widget = gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_BAUHAUS_SPACE);
 
@@ -1285,8 +1819,7 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
   if(!w || w == g->D_film_max_R)
   {
     _do_rgb_densities(self);
-  }
-  
+  }    
 }
 
 
@@ -1297,17 +1830,25 @@ void gui_update(dt_iop_module_t *const self)
   const dt_iop_negadoctor_params_t *const p = (dt_iop_negadoctor_params_t *)self->params;
 
   dt_iop_color_picker_reset(self, TRUE);
-
-
   dt_bauhaus_slider_set(g->exposure, log2f(p->exposure));     // warning: GUI is in EV
 
   // Update custom stuff
+  dt_iop_gui_enter_critical_section(self);
+  dt_bauhaus_combobox_set(g->checkers_list, p->checker);
+  g->checker = dt_get_negadoctor_step_wedge(p->checker);
+  g->safety_margin = dt_conf_get_float("darkroom/modules/negadoctor/safety");
+  dt_bauhaus_slider_set(g->safety, g->safety_margin);
+  dt_iop_gui_leave_critical_section(self);
+
   gui_changed(self, NULL, NULL);
 }
 
 void gui_reset(dt_iop_module_t *self)
 {
+  dt_iop_negadoctor_gui_data_t *const g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
   dt_iop_color_picker_reset(self, TRUE);
+  g->is_profiling_started = FALSE;
+  gui_changed(self, NULL, NULL);
 }
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py

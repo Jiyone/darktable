@@ -32,6 +32,13 @@ typedef enum dt_color_checker_targets
   COLOR_CHECKER_LAST
 } dt_color_checker_targets;
 
+typedef enum dt_density_sepwedge_targets
+{
+  DENSITY_STEPWEDGE_NONE        = 0,
+  DENSITY_STEPWEDGE_STOUFFER_21 = 1,
+  DENSITY_STEPWEDGE_LAST
+} dt_density_sepwedge_targets;
+
 // helper to deal with patch color
 typedef struct dt_color_checker_patch
 {
@@ -63,6 +70,38 @@ typedef struct dt_color_checker_t
   size_t black;                       // index of the closest patch to pure black
   dt_color_checker_patch values[];    // array of colors
 } dt_color_checker_t;
+
+
+typedef struct dt_step_wedge_patch
+{
+  const char *name;        // mnemonic name for the patch
+  dt_aligned_pixel_t Lab;  // reference color in CIE Lab
+
+  // (x, y) position of the patch center, relatively to the guides (white dots)
+  // in ratio of the grid dimension along that axis
+  struct {
+    float x;
+    float y;
+  };
+} dt_step_wedge_patch;
+
+typedef struct dt_step_wedge_t
+{
+  const char *name;
+  const char *author;
+  const char *date;
+  const char *manufacturer;
+  dt_color_checker_targets type;
+
+  float ratio;                        // format ratio of the chart, guide to guide (white dots)
+  float radius;                       // radius of a patch in ratio of the checker diagonal
+  size_t patches;                     // number of patches in target
+  size_t size[2];                     // dimension along x, y axes
+  size_t middle_grey;                 // index of the closest patch to 20% neutral grey
+  size_t white;                       // index of the closest patch to pure white
+  size_t black;                       // index of the closest patch to pure black
+  dt_step_wedge_patch values[];       // array of densities
+} dt_step_wedge_t;
 
 
 dt_color_checker_t xrite_24_2000 = { .name = "Xrite ColorChecker 24 before 2014",
@@ -358,6 +397,39 @@ dt_color_checker_t spyder_48_v2 = {  .name = "Datacolor SpyderCheckr 48 after 20
                                               { "H5", { 65.10,  18.14,  18.68 }, { 0.929, 0.736 } },
                                               { "H6", { 36.13,  14.15,  15.78 }, { 0.929, 0.893 } } } };
 
+dt_step_wedge_t stouffer_21 = { .name = "Stouffer 21 step wedge",
+                                .author = "Stouffer",
+                                .date = "07/09/2024",
+                                .manufacturer = "Stouffer",
+                                .type = DENSITY_STEPWEDGE_STOUFFER_21,
+                                .radius = 0.035f,
+                                .ratio = 1.f / 10.f,
+                                .patches = 21,
+                                .size = { 1, 21 },
+                                .middle_grey = 3,
+                                .white = 21,
+                                .black = 1,
+                                .values = { { "1",  { 10.870, 0, 0 }, { 0.085, 0.666}},
+                                            { "2",  { 36.900, 0, 0 }, { 0.117, 0.666}},
+                                            { "3",  { 55.330, 0, 0 }, { 0.161, 0.666}},
+                                            { "4",  { 68.380, 0, 0 }, { 0.205, 0.666}},
+                                            { "5",  { 77.610, 0, 0 }, { 0.249, 0.666}},
+                                            { "6",  { 84.150, 0, 0 }, { 0.293, 0.666}},
+                                            { "7",  { 88.780, 0, 0 }, { 0.338, 0.666}},
+                                            { "8",  { 92.057, 0, 0 }, { 0.383, 0.666}},
+                                            { "9",  { 94.377, 0, 0 }, { 0.426, 0.666}},
+                                            { "10", { 96.019, 0, 0 }, { 0.470, 0.666}},
+                                            { "11", { 97.182, 0, 0 }, { 0.514, 0.666}},
+                                            { "12", { 98.005, 0, 0 }, { 0.559, 0.666}},
+                                            { "13", { 98.587, 0, 0 }, { 0.603, 0.666}},
+                                            { "14", { 99.000, 0, 0 }, { 0.647, 0.666}},
+                                            { "15", { 99.2921, 0, 0 }, { 0.691, 0.666}},
+                                            { "16", { 99.4988, 0, 0 }, { 0.735, 0.666}},
+                                            { "17", { 99.6452, 0, 0 }, { 0.780, 0.666}},
+                                            { "18", { 99.7488, 0, 0 }, { 0.824, 0.666}},
+                                            { "19", { 99.8222, 0, 0 }, { 0.868, 0.666}},
+                                            { "20", { 99.8741, 0, 0 }, { 0.912, 0.666}},
+                                            { "21", { 99.9109, 0, 0 }, { 0.957, 0.666}} } };
 
 dt_color_checker_t * dt_get_color_checker(const dt_color_checker_targets target_type)
 {
@@ -386,6 +458,11 @@ dt_color_checker_t * dt_get_color_checker(const dt_color_checker_targets target_
   }
 
   return &xrite_24_2014;
+}
+
+dt_step_wedge_t * dt_get_negadoctor_step_wedge(const dt_density_sepwedge_targets target_type)
+{
+  return &stouffer_21;
 }
 
 /**
