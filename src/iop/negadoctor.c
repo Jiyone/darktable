@@ -107,6 +107,16 @@ typedef enum density_val_t
   RANGE_LAST_FIELD
 } density_val_t;
 
+typedef struct dt_extraction_data_t
+{
+  int width;
+  int height;
+  float radius_x;
+  float radius_y;
+  float *homography;
+  float *inverse_homography;
+}dt_extraction_data_t;
+
 typedef struct dt_iop_negadoctor_params_t
 {
   dt_iop_negadoctor_filmstock_t film_stock; /* $DEFAULT: DT_FILMSTOCK_COLOR $DESCRIPTION: "film stock" */
@@ -166,6 +176,8 @@ typedef struct dt_iop_negadoctor_gui_data_t
   GtkWidget *D_sampler, *Dmin_range_sampler, *Dmax_range_sampler;
   GtkWidget *D_film_max_R, *D_film_max_G, *D_film_max_B;
   GtkWidget *checkers_list, *safety;
+  GtkWidget *button_commit;
+  gboolean run_validation;      // order a profile validation at next pipeline recompute
   float homography[9];          // the perspective correction matrix
   float inverse_homography[9];  // The inverse perspective correction matrix
   gboolean checker_ready;       // notify that a checker bounding box is ready to be used
@@ -194,6 +206,13 @@ typedef struct dt_iop_negadoctor_global_data_t
   int kernel_negadoctor;
 } dt_iop_negadoctor_global_data_t;
 
+typedef struct density_result_t
+{
+  float ref_Dmax;
+  float ref_Dmin;
+  float Dmax_test[3];
+  float Dmin_test[3];
+} density_result_t;
 
 const char *name()
 {
@@ -284,11 +303,183 @@ int legacy_params(dt_iop_module_t *self, const void *const old_params, const int
   return 1;
 }
 
+static inline void _get_densities(float *patches, dt_aligned_pixel_t pix)
+{
+  for(int c = 0; c < 3; c++) pix[c] = log10f(1.f / patches[c]);
+}
+
+static void _get_patch_average(const float *const restrict in, const dt_step_wedge_t *checker, float *const restrict patches, const dt_extraction_data_t dim)
+{
+  /* Get the average color over each patch */
+  for(size_t k = 0; k < checker->patches; k++)
+  {
+    // center of the patch in the ideal reference
+    const point_t center = { checker->values[k].x, checker->values[k].y };
+
+    // corners of the patch in the ideal reference
+    const point_t corners[4] = { {center.x - dim.radius_x, center.y - dim.radius_y},
+                                 {center.x + dim.radius_x, center.y - dim.radius_y},
+                                 {center.x + dim.radius_x, center.y + dim.radius_y},
+                                 {center.x - dim.radius_x, center.y + dim.radius_y} };
+
+    // apply patch coordinates transform depending on perspective
+    point_t new_corners[4];
+    // find the bounding box of the patch at the same time
+    size_t x_min = dim.width - 1;
+    size_t x_max = 0;
+    size_t y_min = dim.height - 1;
+    size_t y_max = 0;
+    for(size_t c = 0; c < 4; c++) {
+      new_corners[c] = apply_homography(corners[c], dim.homography);
+      x_min = fminf(new_corners[c].x, x_min);
+      x_max = fmaxf(new_corners[c].x, x_max);
+      y_min = fminf(new_corners[c].y, y_min);
+      y_max = fmaxf(new_corners[c].y, y_max);
+    }
+
+    x_min = CLAMP((size_t)floorf(x_min), 0, dim.width - 1);
+    x_max = CLAMP((size_t)ceilf(x_max), 0, dim.width - 1);
+    y_min = CLAMP((size_t)floorf(y_min), 0, dim.height - 1);
+    y_max = CLAMP((size_t)ceilf(y_max), 0, dim.height - 1);
+
+    //// Get the average color on the patch
+    patches[k * 4] = patches[k * 4 + 1] = patches[k * 4 + 2] = patches[k * 4 + 3] = 0.f;
+    size_t num_elem = 0;
+
+    // Loop through the rectangular bounding box
+    for(size_t j = y_min; j < y_max; j++)
+      for(size_t i = x_min; i < x_max; i++)
+      {
+        // Check if this pixel lies inside the sampling area and sample if it does
+        point_t current_point = { i + 0.5f, j + 0.5f };
+        current_point = apply_homography(current_point, dim.inverse_homography);
+        current_point.x -= center.x;
+        current_point.y -= center.y;
+
+        if(current_point.x < dim.radius_x && current_point.x > -dim.radius_x &&
+           current_point.y < dim.radius_y && current_point.y > -dim.radius_y)
+        {
+          for(size_t c = 0; c < 3; c++)
+          {
+            patches[k * 4 + c] += in[(j * dim.width + i) * 4 + c];
+
+            // Debug : inpaint a black square in the preview to ensure the coordinates of
+            // overlay drawings and actual pixel processing match
+            // out[(j * width + i) * 4 + c] = 0.f;
+          }
+          num_elem++;
+        }
+      }
+
+    for(size_t c = 0; c < 3; c++) patches[k * 4 + c] /= (float)num_elem;
+
+    // Convert to density
+    
+    dt_aligned_pixel_t densities;
+    _get_densities(patches + k * 4, densities);
+    for(size_t o = 0; o < 3; o++) patches[k * 4 + o] = densities[o];
+
+    fprintf(stdout, "[NEG ref] Patch %i: %.2f %.2f %.2f\n", k, patches[k * 4], patches[k * 4 + 1], patches[k * 4 + 2]);
+  }
+  fprintf(stdout, "[NEG ref] End of _get_patch_average\n\n");
+}
+
+static const density_result_t _extract_patches(const float *const restrict in, const dt_iop_roi_t *const roi_in, dt_iop_negadoctor_gui_data_t *g,
+                                                  float *const restrict patches)
+{
+  const float rx = g->checker->radius * hypotf(1.f, g->checker->ratio) * g->safety_margin;
+
+  dt_extraction_data_t dimensions = { roi_in->width,
+                                            roi_in->height,
+                                            rx,
+                                            rx / g->checker->ratio,
+                                            g->homography,
+                                            g->inverse_homography };
+
+  _get_patch_average(in, g->checker, patches, dimensions);
+
+  // find reference white and black patch
+  float ref_Dmax = g->checker->values[g->checker->dmax].density;
+  float ref_Dmin = g->checker->values[g->checker->dmin].density;
+
+  fprintf(stdout, "[NEG ref] Dmax: %f\t Dmin: %f\n", ref_Dmax, ref_Dmin);
+  // find test dmax and dmin patch
+  float Dmax_test[3];
+  for(size_t c = 0; c < 3; c++)
+  {
+    Dmax_test[c] = patches[g->checker->dmax * 4 + c];
+    fprintf(stdout, "[NEG ref] Dmax_test: %f\n", Dmax_test[c]);
+  }
+
+  float Dmin_test[3];
+  for(size_t c = 0; c < 3; c++)
+  {
+    Dmin_test[c] = patches[g->checker->dmin * 4 + c];
+    fprintf(stdout, "[NEG ref] Dmin_test: %f\n", Dmin_test[c]);
+  }
+
+  const density_result_t result = { ref_Dmax, ref_Dmin,
+                                    { Dmax_test[0], Dmax_test[1], Dmax_test[2] },
+                                    { Dmin_test[0], Dmin_test[1], Dmin_test[2] } };
+  return result;
+}
+
+void validate_color_checker(const float *const restrict in, dt_dev_pixelpipe_iop_t *const piece,
+                            const dt_iop_roi_t *const roi_in, struct dt_iop_module_t *const self)
+{
+  dt_iop_negadoctor_params_t *p = (dt_iop_negadoctor_params_t *)self->params;
+  //const dt_iop_negadoctor_data_t *const d = piece->data;
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
+
+  float *const restrict patches = dt_alloc_sse_ps(4 * g->checker->patches);
+  density_result_t val = _extract_patches(in, roi_in, g, patches);
+
+  // Update GUI label
+
+  for(int c = 0; c < 3; c++)
+  {
+    p->D[c] = val.Dmax_test[c];
+    p->D[c + 3] = val.Dmax_test[c + 3];
+    p->D_film_max[c] = val.ref_Dmax;
+  }
+  fprintf(stdout, "[NEG ref] range D max: %f %f %f\n", p->D[0], p->D[1], p->D[2]);
+  fprintf(stdout, "[NEG ref] range D min: %f %f %f\n", p->D[3], p->D[4], p->D[5]);
+  fprintf(stdout, "[NEG ref] ref dmax: %f\n", p->D[0], p->D_film_max);
+
+  float thing[3] = { 0.f };
+  float average[2][3] = {{ 0.f }};
+
+  for(int k = 0; k < 9; k++) 
+  {
+    size_t channel = k % 3;
+
+    thing[channel] = p->D[k] * val.ref_Dmax / val.Dmax_test[channel];
+    //g_free(g->density_info[k]);
+    gtk_label_set_text(GTK_LABEL(g->density_info[k]), g_strdup_printf("%.2f", thing[channel]));
+
+    if(k % 3 == 2)
+    {
+      average[0][k / 3] = v_minf(thing);
+      average[1][k / 3] = v_maxf(thing);
+    }
+  }
+
+  for(int a = 0; a < 3; a++)
+  {
+    float averaged = (average[0][a] + average[1][a]) / 2;
+    //g_free(g->density_info[a + 9]);
+    gtk_label_set_text(GTK_LABEL(g->density_info[a + 9]), g_strdup_printf("%.2f", averaged));
+  }
+
+  dt_free_align(patches);
+}
+
 void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
                    dt_dev_pixelpipe_iop_t *piece)
 {
   const dt_iop_negadoctor_params_t *const p = (dt_iop_negadoctor_params_t *)p1;
   dt_iop_negadoctor_data_t *const d = (dt_iop_negadoctor_data_t *)piece->data;
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
 
   // keep WB_high even in B&W mode to apply sepia or warm tone look
   // but premultiply it aheard with Dmax to spare one div per pixel
@@ -312,14 +503,27 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   // copy
   d->exposure = p->exposure;
   d->gamma = p->gamma;
-}
 
+  // Disable OpenCL path if we are in any kind of diagnose mode (only C path has diagnostics)
+  if(self->dev->gui_attached && g)
+  {
+    if( /*(g->run_profile && piece->pipe->type == DT_DEV_PIXELPIPE_PREVIEW) || // color checker extraction mode*/
+        (g->run_validation && piece->pipe->type == DT_DEV_PIXELPIPE_PREVIEW) /*|| // delta E validation
+        ( (d->illuminant_type == DT_ILLUMINANT_DETECT_EDGES ||
+           d->illuminant_type == DT_ILLUMINANT_DETECT_SURFACES ) && // WB extraction mode
+           piece->pipe->type == DT_DEV_PIXELPIPE_FULL )*/ )
+    {
+      piece->process_cl_ready = 0;
+    }
+  }
+}
 
 void process(struct dt_iop_module_t *const self, dt_dev_pixelpipe_iop_t *const piece,
              const void *const restrict ivoid, void *const restrict ovoid,
              const dt_iop_roi_t *const restrict roi_in, const dt_iop_roi_t *const restrict roi_out)
 {
   const dt_iop_negadoctor_data_t *const d = piece->data;
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
   assert(piece->colors = 4);
 
   const float *const restrict in = (float *)ivoid;
@@ -360,6 +564,18 @@ void process(struct dt_iop_module_t *const self, dt_dev_pixelpipe_iop_t *const p
 
   if(piece->pipe->mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK)
     dt_iop_alpha_copy(ivoid, ovoid, roi_out->width, roi_out->height);
+
+  // Density reading
+  if(self->dev->gui_attached && g)
+  {  
+    fprintf(stdout, "[NEG ref] run?: %s\n",g->run_validation ? "YES" : "NO" );
+    fprintf(stdout, "[NEG ref] checker: %i\n", g->checker);
+    if(g->run_validation && piece->pipe->type == DT_DEV_PIXELPIPE_PREVIEW && g->checker)
+    {
+      validate_color_checker(in, piece, roi_out, self);
+      g->run_validation = FALSE;
+    }
+  }
 }
 
 
@@ -879,6 +1095,7 @@ static void apply_auto_exposure(dt_iop_module_t *self)
 
 static void _do_rgb_densities(dt_iop_module_t *self)
 {
+  if(darktable.gui->reset) return;
   const dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
   const dt_iop_negadoctor_params_t *p = (dt_iop_negadoctor_params_t *)self->params;
 
@@ -1440,6 +1657,7 @@ static void checker_changed_callback(GtkWidget *widget, gpointer user_data)
   {
     fprintf(stdout, "CHECKER: NONE\n");
     gtk_widget_set_visible(g->safety, FALSE);
+    gtk_widget_set_visible(g->button_commit, FALSE);
     g->is_profiling_started = FALSE;
     g->checker_ready = FALSE;
     dt_control_queue_redraw_center();
@@ -1448,6 +1666,7 @@ static void checker_changed_callback(GtkWidget *widget, gpointer user_data)
   {
     g->checker = dt_get_negadoctor_step_wedge(p->checker - 1); // use selected step wedge
     gtk_widget_set_visible(g->safety, TRUE);
+    gtk_widget_set_visible(g->button_commit, TRUE);
   
     // now we have a step wedge
     fprintf(stdout, "CHECKER: %s\n", g->checker->name);
@@ -1470,8 +1689,19 @@ static void safety_changed_callback(GtkWidget *widget, gpointer user_data)
   dt_control_queue_redraw_center();
 }
 
+static void run_validation_callback(GtkWidget *widget, GdkEventButton *event, gpointer user_data)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
+  dt_iop_negadoctor_gui_data_t *g = (dt_iop_negadoctor_gui_data_t *)self->gui_data;
 
+  dt_iop_gui_enter_critical_section(self);
+  g->run_validation = TRUE;
+  dt_iop_gui_leave_critical_section(self);
 
+  dt_dev_invalidate_preview(self->dev);
+  dt_dev_refresh_ui_images(self->dev);
+}
 
 
 void gui_init(dt_iop_module_t *self)
@@ -1702,6 +1932,16 @@ void gui_init(dt_iop_module_t *self)
                                            "the patches frame cast a shadows on the edges of the patch." ));
   g_signal_connect(G_OBJECT(g->safety), "value-changed", G_CALLBACK(safety_changed_callback), self);
   gtk_box_pack_start(GTK_BOX(g_stepwedge), GTK_WIDGET(g->safety), TRUE, FALSE, 0);
+
+  GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_BAUHAUS_SPACE);
+
+  g->button_commit = dtgtk_button_new(dtgtk_cairo_paint_check_mark, 0, NULL);
+  g_signal_connect(G_OBJECT(g->button_commit), "button-press-event", G_CALLBACK(run_validation_callback), (gpointer)self);
+  gtk_widget_set_tooltip_text(g->button_commit, _("Read density value"));
+  gtk_box_pack_end(GTK_BOX(toolbar), GTK_WIDGET(g->button_commit), FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(g_stepwedge), GTK_WIDGET(toolbar), FALSE, FALSE, 0);
+
+ 
   gtk_box_pack_start(GTK_BOX(page4), GTK_WIDGET(g_stepwedge), FALSE, FALSE, 0);
 
   gtk_box_pack_start(GTK_BOX(page4), dt_ui_section_label_new(_("Densities")), FALSE, FALSE, 0);
@@ -1835,6 +2075,16 @@ void gui_update(dt_iop_module_t *const self)
   // Update custom stuff
   dt_iop_gui_enter_critical_section(self);
   dt_bauhaus_combobox_set(g->checkers_list, p->checker);
+  if(p->checker)
+  {
+    gtk_widget_set_visible(g->safety, TRUE);
+    gtk_widget_set_visible(g->button_commit, TRUE);
+  }
+  else
+  {
+    gtk_widget_set_visible(g->safety, FALSE);
+    gtk_widget_set_visible(g->button_commit, FALSE);
+  }
   g->checker = dt_get_negadoctor_step_wedge(p->checker);
   g->safety_margin = dt_conf_get_float("darkroom/modules/negadoctor/safety");
   dt_bauhaus_slider_set(g->safety, g->safety_margin);
